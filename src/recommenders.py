@@ -17,31 +17,59 @@ class MainRecommender:
     -----
     user_item_matrix: pd.DataFrame
         Матрица взаимодействий user-item
+    weiting: string
+        Тип взвешивания, один из вариантов: None, 'bm25', 'tfidf'
+    fake_id: int
+        Идентификатор, которым заменялись режкие объекты, либо None
     """
 
     # data здесь - исходная таблица с данными (data_train)
-    def __init__(self, data, weighting='tfidf'):
+    # можно добавить параметры для настройки гиперпараметров моделей
+    def __init__(self, data, weighting=None, fake_id=999999):
 
         # your_code. Это не обязательная часть. Но если вам удобно что-либо посчитать тут - можно это сделать
-        assert weighting in ['tfidf', 'bm25', 'no'], 'Неверно указан метод'
+        assert weighting in ['tfidf', 'bm25', None], 'Неверно указан метод'
 
-        self.data = data
-        self.user_item_matrix = self.prepare_matrix(data)  # pd.DataFrame
-        self.id_to_itemid, self.id_to_userid, self.itemid_to_id, self.userid_to_id = self.prepare_dicts(
+        # топ покупок каждого юзера
+        self.top_purchases = data.groupby(['user_id', 'item_id'])['quantity'].count().reset_index()
+        self.top_purchases.sort_values('quantity', ascending=False, inplace=True)
+        if fake_id is not None:
+            self.top_purchases = self.top_purchases.loc[self.top_purchases['item_id'] != fake_id]
+
+        # топ покупок по всему датасету
+        self.overall_top_purchases = data.groupby(['item_id'])['quantity'].count().reset_index()
+        self.overall_top_purchases.sort_values('quantity', ascending=False, inplace=True)
+        if fake_id is not None:
+            self.overall_top_purchases = self.overall_top_purchases.loc[
+                self.overall_top_purchases['item_id'] != fake_id]
+        self.overall_top_purchases = self.overall_top_purchases.item_id.tolist()
+
+        # дальнейшая предобработка
+        self.fake_id = fake_id
+        #         self.data = data
+        self.user_item_matrix = self._prepare_matrix(data)  # pd.DataFrame
+        self.id_to_itemid, self.id_to_userid, self.itemid_to_id, self.userid_to_id = self._prepare_dicts(
             self.user_item_matrix)
+        # эту матрицу можно взвесить
+        self.user_item_matrix = csr_matrix(self.user_item_matrix).tocsr()
+        # а эта останется для предсказаний
+        self.user_item_matrix_for_pred = self.user_item_matrix
 
-        if weighting == 'tfidf':
-            self.user_item_matrix = tfidf_weight(self.user_item_matrix)
-        elif weighting == 'bm25':
-            self.user_item_matrix = bm25_weight(self.user_item_matrix)
-        elif weighting != 'no':
-            print('Error')
+        if weighting == 'bm25':
+            self.user_item_matrix = bm25_weight(self.user_item_matrix).tocsr()
+            # self.user_item_matrix = bm25_weight(self.user_item_matrix.T).T.tocsr()
+        elif weighting == 'tfidf':
+            self.user_item_matrix = tfidf_weight(self.user_item_matrix).tocsr()
+            # self.user_item_matrix = tfidf_weight(self.user_item_matrix.T).T.tocsr()
+
+        # пользователи, которых можно включать в вывод для similar_users
+        self.users_for_similar = [self.userid_to_id[x] for x in self.top_purchases['user_id'].unique()]
 
         self.model = self.fit(self.user_item_matrix)
         self.own_recommender = self.fit_own_recommender(self.user_item_matrix)
 
     @staticmethod
-    def prepare_matrix(data, values='quantity'):  # выбор столбца для значений
+    def _prepare_matrix(data, values='quantity'):  # выбор столбца для значений
 
         # your_code
         user_item_matrix = pd.pivot_table(data,
@@ -55,7 +83,7 @@ class MainRecommender:
         return user_item_matrix.astype(float)
 
     @staticmethod
-    def prepare_dicts(user_item_matrix):
+    def _prepare_dicts(user_item_matrix):
         """Подготавливает вспомогательные словари"""
 
         userids = user_item_matrix.index.values
@@ -77,7 +105,7 @@ class MainRecommender:
         """Обучает модель, которая рекомендует товары, среди товаров, купленных юзером"""
 
         own_recommender = ItemItemRecommender(K=2, num_threads=4)
-        own_recommender.fit(csr_matrix(user_item_matrix).tocsr())
+        own_recommender.fit(user_item_matrix)
 
         return own_recommender
 
@@ -89,84 +117,115 @@ class MainRecommender:
                                         regularization=regularization,
                                         iterations=iterations,
                                         num_threads=num_threads)
-        model.fit(csr_matrix(user_item_matrix.tocsr()))
+        model.fit(user_item_matrix)
 
         return model
 
-    def get_recommendations(self, user, N=5):
-        """Рекомендуем топ-N товаров"""
+    def _update_dict(self, user_id):
+        """Обновляет словари, если появился новый user/item"""
 
-        res = [self.id_to_itemid[rec] for rec in
-               self.model.recommend(userid=self.userid_to_id[user],
-                                    user_items=self.user_item_matrix.tocsr()[self.userid_to_id[user]],
-                                    N=N,
-                                    filter_already_liked_items=False,
-                                    filter_items=[self.itemid_to_id[999999]],
-                                    recalculate_user=True)[0]]
+        if user_id not in self.userid_to_id.keys():
+            max_id = max(list(self.userid_to_id.values())) + 1
+
+            self.userid_to_id.update({user_id: max_id})
+            self.id_to_userid.update({max_id: user_id})
+
+    def _get_similar_item(self, item_id):
+        """Находит товар, похожий на item_id"""
+        recs = self.model.similar_items(self.itemid_to_id[item_id], N=2)
+        # первый наиболее похожий - сам товар
+        top_rec = recs[0][1]
+        return self.id_to_itemid[top_rec]
+
+    def _extend_with_top_popular(self, recommendations, N=5):
+        """Если число рекомендаций < N, дополняем из из top-popular"""
+
+        if len(recommendations) < N:
+            top_popular = [rec for rec in self.overall_top_purchases[:N] if rec not in recommendations]
+            recommendations.extend(top_popular)
+            recommendations = recommendations[:N]
+
+        return recommendations
+
+    def _get_recommendations(self, user, model, N=5):
+        """Рекомендации через стандартные библиотеки implicit"""
+
+        self._update_dict(user_id=user)
+        filter_items = [] if self.fake_id is None else [self.itemid_to_id[self.fake_id]]
+        res = model.recommend(userid=self.userid_to_id[user],
+                              user_items=self.user_item_matrix_for_pred[self.userid_to_id[user]],
+                              N=N,
+                              filter_already_liked_items=False,
+                              filter_items=filter_items,
+                              recalculate_user=True
+                              )
+        # implicit версии 0.6.2 сортирует как для ALS, так и длия ItemItemRecommender
+        # mask = res[1].argsort()[::-1]
+        # res = [self.id_to_itemid[rec] for rec in res[0][mask]]
+        res = [self.id_to_itemid[rec] for rec in res[0]]
+        res = self._extend_with_top_popular(res, N=N)
+
+        assert len(res) == N, 'Количество рекомендаций != {}'.format(N)
         return res
+
+    def get_als_recommendations(self, user, N=5):
+        """Рекомендации через стандартные библиотеки implicit"""
+
+        return self._get_recommendations(user, model=self.model, N=N)
+
+    def get_own_recommendations(self, user, N=5):
+        """Рекомендации товары среди тех, которые юзер уже купил"""
+
+        return self._get_recommendations(user, model=self.own_recommender, N=N)
 
     def get_similar_items_recommendation(self, user, N=5):
         """Рекомендуем товары, похожие на топ-N купленных юзером товаров"""
 
         # your_code
-        # принимает 1 пользователя
-        popularity = (self.data.loc[self.data['user_id'] == user]
-                      .groupby(['user_id', 'item_id'])['quantity']
-                      .count()
-                      .reset_index()
-                      .sort_values('quantity', ascending=False)
-                      )
-        popularity = popularity[popularity['item_id'] != 999999]
-        popularity = popularity.head(5).item_id.to_list()
-        # если куплено менее 5 товаров
-        # для самого частого рекомендуем столько, чтобы добрать до 5
-        # чуть лучше метрика
-        if len(popularity) < N:
-            k = N - len(popularity)
-            #             print(user)
-            #             print(len(popularity))
-            res = [self.id_to_itemid[rec]
-                   for rec in self.model.similar_items(self.itemid_to_id[popularity[0]], N=2 + k)[0][1:]]
-            res += [self.id_to_itemid[self.model.similar_items(self.itemid_to_id[top_item], N=2)[0][1]]
-                    for top_item in popularity[1:]]
-        else:
-            res = [self.id_to_itemid[self.model.similar_items(self.itemid_to_id[top_item], N=2)[0][1]]
-                   for top_item in popularity]
-
-        # или просто отфильтровать пользователей с менее 5 уникальных покупок
-#         res = [self.id_to_itemid[self.model.similar_items(self.itemid_to_id[top_item], N=2)[0][1]]
-#                        for top_item in popularity]
+        self._update_dict(user_id=user)
+        top5 = self.top_purchases.loc[self.top_purchases['user_id'] == user].head(5)['item_id'].to_list()
+        # res = [self.id_to_itemid[self.model.similar_items(self.itemid_to_id[top_item], N=2)[0][1]]
+        #            for top_item in top5]
+        res = [self._get_similar_item(item) for item in top5]
+        res = self._extend_with_top_popular(res, N=N)
 
         assert len(res) == N, 'Количество рекомендаций != {}'.format(N)
-        # товары отсортированы по quantity для исходного товара
+        # рекомендации отсортированы по quantity для исходного товара
         return res
 
+        # топ похожих юзеров + по одному товару от каждого
+        # если товар следующего пользователя уже есть - берём 2 товар этого пользователя
+        # и это неоптимально?
     def get_similar_users_recommendation(self, user, N=5):
         """Рекомендуем топ-N товаров, среди купленных похожими юзерами"""
 
         # your_code
-        # упорядочиваем рекомендации, тк own_recommender выдаёт неупорядоченные
-#         recs = self.own_recommender.recommend(userid=self.userid_to_id[user],
-#                                               user_items=self.user_item_matrix.tocsr()[self.userid_to_id[user]],
-#                                               N=N,
-#                                               filter_already_liked_items=True,
-#                                               filter_items=[self.itemid_to_id[999999]],
-#                                               recalculate_user=True)
-#         mask = recs[1].argsort()[::-1]  # получим индекс для сортировки
-#         res = [self.id_to_itemid[rec] for rec in recs[0][mask]]
-        #
-        # на самом деле, возвращает упорядоченные в версии 0.6.2
-        res = [self.id_to_itemid[rec]
-               for rec in self.own_recommender.recommend(userid=self.userid_to_id[user],
-                                                         user_items=self.user_item_matrix.tocsr()[
-                                                             self.userid_to_id[user]],
-                                                         N=N - 1,  # почему-то даёт рекомендаций на 1 больше
-                                                         filter_already_liked_items=False,
-                                                         filter_items=[self.itemid_to_id[999999]],
-                                                         recalculate_user=True)[0]]
+        self._update_dict(user_id=user)
 
-        if len(res) < N:
-            print(user)
-            print(len(res))
+        # это костыль, но он работает: проверить, что userid есть в item-item матрице
+        if self.userid_to_id[user] < self.user_item_matrix.shape[0]:
+            # users=self.users_for_similar оставляет в выводе только те userid, которые есть в
+            # top_purchases
+            similar_users = self.model.similar_users(self.userid_to_id[user],
+                                                     N=N + 1,
+                                                     users=self.users_for_similar)[0][1:]
+            similar_users = [self.id_to_userid[x] for x in similar_users]
+            similar_users_items = (self.top_purchases.loc[self.top_purchases['user_id'].isin(similar_users)]
+                .groupby('user_id')['item_id']
+                .unique()[similar_users]
+                )
+            res = []
+            # добавляем первую покупку юзера, если её ещё нет в рекомендациях, иначе - следующую...
+            for u in similar_users_items.index:
+                for items in similar_users_items[u]:
+                    if items in res:
+                        continue
+                    res.append(items)
+                    break
+
+        else:
+            res = []
+        res = self._extend_with_top_popular(res, N=N)
+
         assert len(res) == N, 'Количество рекомендаций != {}'.format(N)
         return res
