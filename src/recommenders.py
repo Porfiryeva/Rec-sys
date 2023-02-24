@@ -56,7 +56,7 @@ class MainRecommender:
         self.user_item_matrix_for_pred = self.user_item_matrix
 
         if weighting == 'bm25':
-            self.user_item_matrix = bm25_weight(self.user_item_matrix).tocsr()
+            self.user_item_matrix = bm25_weight(self.user_item_matrix, K1=120, B=0.6).tocsr()
             # self.user_item_matrix = bm25_weight(self.user_item_matrix.T).T.tocsr()
         elif weighting == 'tfidf':
             self.user_item_matrix = tfidf_weight(self.user_item_matrix).tocsr()
@@ -104,19 +104,22 @@ class MainRecommender:
     def fit_own_recommender(user_item_matrix):
         """Обучает модель, которая рекомендует товары, среди товаров, купленных юзером"""
 
-        own_recommender = ItemItemRecommender(K=2, num_threads=4)
+        own_recommender = ItemItemRecommender(K=1, num_threads=4)
         own_recommender.fit(user_item_matrix)
 
         return own_recommender
 
     @staticmethod
-    def fit(user_item_matrix, n_factors=20, regularization=0.02, iterations=15, num_threads=4):
+    #     def fit(user_item_matrix, n_factors=300, regularization=1, alpha=0.5, iterations=15):
+    # эти параметры незначительно хуже, но быстрее!
+    def fit(user_item_matrix, n_factors=200, regularization=0.05, alpha=0.8, iterations=15):
         """Обучает ALS"""
 
         model = AlternatingLeastSquares(factors=n_factors,
                                         regularization=regularization,
                                         iterations=iterations,
-                                        num_threads=num_threads)
+                                        alpha=alpha,
+                                        random_state=42)
         model.fit(user_item_matrix)
 
         return model
@@ -144,6 +147,9 @@ class MainRecommender:
             top_popular = [rec for rec in self.overall_top_purchases[:N] if rec not in recommendations]
             recommendations.extend(top_popular)
             recommendations = recommendations[:N]
+        # own где-то цепляет 1 лишюю рек, те для него бы свою ф-ю
+        if len(recommendations) > N:
+            recommendations = recommendations[:N]  
 
         return recommendations
 
@@ -163,7 +169,8 @@ class MainRecommender:
         # mask = res[1].argsort()[::-1]
         # res = [self.id_to_itemid[rec] for rec in res[0][mask]]
         res = [self.id_to_itemid[rec] for rec in res[0]]
-        res = self._extend_with_top_popular(res, N=N)
+        # own-rec где-то цепляет лишнюю рекомендацию
+        res = self._extend_with_top_popular(res, N=N)[:N]
 
         assert len(res) == N, 'Количество рекомендаций != {}'.format(N)
         return res
@@ -178,7 +185,7 @@ class MainRecommender:
 
         return self._get_recommendations(user, model=self.own_recommender, N=N)
 
-    def get_similar_items_recommendation(self, user, N=5):
+    def get_similar_items_recommendations(self, user, N=5):
         """Рекомендуем товары, похожие на топ-N купленных юзером товаров"""
 
         # your_code
@@ -196,7 +203,7 @@ class MainRecommender:
         # топ похожих юзеров + по одному товару от каждого
         # если товар следующего пользователя уже есть - берём 2 товар этого пользователя
         # и это неоптимально?
-    def get_similar_users_recommendation(self, user, N=5):
+    def get_similar_users_recommendations(self, user, n_similar=3, N=5):
         """Рекомендуем топ-N товаров, среди купленных похожими юзерами"""
 
         # your_code
@@ -207,7 +214,7 @@ class MainRecommender:
             # users=self.users_for_similar оставляет в выводе только те userid, которые есть в
             # top_purchases
             similar_users = self.model.similar_users(self.userid_to_id[user],
-                                                     N=N + 1,
+                                                     N=n_similar + 1,
                                                      users=self.users_for_similar)[0][1:]
             similar_users = [self.id_to_userid[x] for x in similar_users]
             similar_users_items = (self.top_purchases.loc[self.top_purchases['user_id'].isin(similar_users)]
